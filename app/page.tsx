@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { connectHousehold, deleteHouseholdEntry, isFirebaseConfigured, refreshHouseholdEntries, saveHouseholdEntry, type CloudEntry } from './firebase';
 
 type Side = 'left' | 'right';
@@ -46,6 +46,7 @@ export default function Home() {
   const [reminderHours,setReminderHours]=useState(0);
   const [editDraft,setEditDraft]=useState<EditDraft|null>(null);
   const [undo,setUndo]=useState<UndoAction>(null);
+  const activeWritePending=useRef(0);
 
   useEffect(()=>{
     try { setEntries(JSON.parse(localStorage.getItem(FEEDS_KEY)||'[]')); setActive(JSON.parse(localStorage.getItem(ACTIVE_KEY)||'null')); setHousehold(localStorage.getItem(HOUSEHOLD_KEY)||''); setReminderHours(Number(localStorage.getItem(REMINDER_KEY)||0)); } catch { /* Ignore damaged local data. */ }
@@ -65,8 +66,10 @@ export default function Home() {
       if(!cloudEntries.length&&localEntries.length) {
         Promise.all(localEntries.map(entry=>saveHouseholdEntry(household,entry as unknown as CloudEntry))).catch(()=>setSyncState('error'));
       }
-      if(!cloudActive&&localActive) saveHouseholdEntry(household,{...localActive,id:ACTIVE_CLOUD_ID,type:'active'} as unknown as CloudEntry).catch(()=>setSyncState('error'));
-      else setActive(cloudActive?cloudActive as unknown as ActiveSession:null);
+      if(activeWritePending.current===0) {
+        if(!cloudActive&&localActive) saveHouseholdEntry(household,{...localActive,id:ACTIVE_CLOUD_ID,type:'active'} as unknown as CloudEntry).catch(()=>setSyncState('error'));
+        else setActive(cloudActive?cloudActive as unknown as ActiveSession:null);
+      }
       if(cloudEntries.length||!localEntries.length)setEntries(cloudEntries);
       setSyncState('synced');
     },()=>setSyncState('error')).then((stop)=>{unsubscribe=stop;}).catch(()=>setSyncState('error'));
@@ -96,11 +99,25 @@ export default function Home() {
     setEntries(current=>current.filter(e=>e.id!==id));
     if(household&&isFirebaseConfigured()) try { await deleteHouseholdEntry(household,id); } catch { setSyncState('error'); }
   }
-  function setSharedActive(next:Active) {
-    setActive(next);
+  async function writeSharedActive(next:Active) {
     if(!household||!isFirebaseConfigured())return;
-    if(next) void saveHouseholdEntry(household,{...next,id:ACTIVE_CLOUD_ID,type:'active'} as unknown as CloudEntry).catch(()=>setSyncState('error'));
-    else void deleteHouseholdEntry(household,ACTIVE_CLOUD_ID).catch(()=>setSyncState('error'));
+    activeWritePending.current+=1;
+    try {
+      if(next) await saveHouseholdEntry(household,{...next,id:ACTIVE_CLOUD_ID,type:'active'} as unknown as CloudEntry);
+      else await deleteHouseholdEntry(household,ACTIVE_CLOUD_ID);
+    } catch { setSyncState('error'); }
+    finally { activeWritePending.current-=1; }
+  }
+  function setSharedActive(next:ActiveSession) {
+    setActive(next);
+    void writeSharedActive(next);
+  }
+  function resetTimer(confirmReset=true) {
+    if(!active)return;
+    if(confirmReset&&!window.confirm('Reset this shared timer? The current elapsed time will be discarded.'))return;
+    setActive(null);
+    localStorage.removeItem(ACTIVE_KEY);
+    void writeSharedActive(null);
   }
   function chooseSide(side:Side) {
     const timestamp=Date.now(); setNow(timestamp);
@@ -118,7 +135,7 @@ export default function Home() {
   function finish() {
     if(!active)return; const timestamp=Date.now(),segment=active.isPaused?0:Math.max(0,Math.floor((timestamp-active.segmentStartedAt)/1000));
     const entry:NursingEntry={id:crypto.randomUUID(),type:'nursing',startedAt:active.startedAt,endedAt:timestamp,leftDuration:active.leftDuration+(active.currentSide==='left'?segment:0),rightDuration:active.rightDuration+(active.currentSide==='right'?segment:0),startSide:active.startSide??active.currentSide,endSide:active.currentSide};
-    setSharedActive(null); void rawPersist(entry); setUndo({message:'Feeding saved',action:()=>rawDelete(entry.id)});
+    resetTimer(false); void rawPersist(entry); setUndo({message:'Feeding saved',action:()=>rawDelete(entry.id)});
   }
   function addFormula() {
     const amount=Math.round(Number(formulaAmount)*10)/10; if(!amount||amount<=0)return; const timestamp=Date.now();
@@ -168,7 +185,7 @@ export default function Home() {
     <section className="hero" aria-labelledby="timer-heading"><div className="eyebrow">Current feed</div><h2 id="timer-heading">{active?(active.isPaused?'Feeding paused':`${active.currentSide==='left'?'Left':'Right'} side`):'Ready when you are'}</h2><div className={`timer ${isRunning?'running':''} ${active?.isPaused?'paused':''}`} aria-live="polite">{clock(liveLeft+liveRight)}</div><p className="started-time">{active?(active.isPaused?'Timer stopped · choose a side, then resume':`Started at ${new Date(active.startedAt).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})} · Nothing logs until you finish`):'Tap a side to begin. Switch sides anytime.'}</p>
       {active&&<div className="live-split"><span>Left <strong>{clock(liveLeft)}</strong></span><span>Right <strong>{clock(liveRight)}</strong></span></div>}
       <div className="side-buttons"><button className={`side-button left ${active?.currentSide==='left'?'active':''}`} onClick={()=>chooseSide('left')}><span className="side-letter">L</span><span>{active?.currentSide==='left'?(active.isPaused?'Left selected':'Timing left'):active?(active.isPaused?'Choose left':'Switch to left'):'Start left'}</span></button><button className={`side-button right ${active?.currentSide==='right'?'active':''}`} onClick={()=>chooseSide('right')}><span className="side-letter">R</span><span>{active?.currentSide==='right'?(active.isPaused?'Right selected':'Timing right'):active?(active.isPaused?'Choose right':'Switch to right'):'Start right'}</span></button></div>
-      {active&&<div className="timer-actions"><button className={`pause-button ${active.isPaused?'resume':''}`} onClick={pauseOrResume}>{active.isPaused?'▶ Resume timer':'Ⅱ Pause timer'}</button><button className="finish-button" onClick={finish}>Finish & save</button></div>}
+      {active&&<div className="timer-actions"><button className={`pause-button ${active.isPaused?'resume':''}`} onClick={pauseOrResume}>{active.isPaused?'▶ Resume':'Ⅱ Pause'}</button><button className="reset-button" onClick={()=>resetTimer()}>Reset</button><button className="finish-button" onClick={finish}>Finish & save</button></div>}
     </section>
 
     <section className="formula-card"><div><div className="eyebrow">Bottle feeding</div><h2>Add bottle</h2><div className="kind-toggle"><button className={bottleKind==='formula'?'selected':''} onClick={()=>setBottleKind('formula')}>Formula</button><button className={bottleKind==='breastmilk'?'selected':''} onClick={()=>setBottleKind('breastmilk')}>Pumped milk</button></div></div><div className="formula-input"><input type="number" min="0.1" step="0.1" inputMode="decimal" value={formulaAmount} onChange={e=>setFormulaAmount(e.target.value)} placeholder="0" aria-label={`Bottle amount in ${bottleUnit}`}/><div className="unit-toggle" aria-label="Bottle unit"><button className={bottleUnit==='mL'?'selected':''} onClick={()=>setBottleUnit('mL')}>mL</button><button className={bottleUnit==='oz'?'selected':''} onClick={()=>setBottleUnit('oz')}>oz</button></div><button onClick={addFormula} disabled={!Number(formulaAmount)}>Add bottle</button></div></section>
