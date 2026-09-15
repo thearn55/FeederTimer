@@ -1,8 +1,9 @@
 import { initializeApp, getApps } from 'firebase/app';
 import { getAuth, signInAnonymously } from 'firebase/auth';
-import { collection, deleteDoc, doc, getDocsFromServer, getFirestore, onSnapshot, setDoc } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDocsFromServer, getFirestore, onSnapshot, runTransaction, setDoc } from 'firebase/firestore';
+import { sameTimerRevision } from './feed-state';
 
-export type CloudEntry = Record<string, string | number> & { id: string };
+export type CloudEntry = Record<string, string | number | boolean> & { id: string };
 
 // Replace these six values with the Web App configuration from Firebase.
 const firebaseConfig = {
@@ -37,9 +38,24 @@ function sortedEntries(documents: { data: () => unknown }[]) {
 
 export async function connectHousehold(code: string, onEntries: (entries: CloudEntry[]) => void, onError: () => void) {
   const { db } = await signedInServices();
-  return onSnapshot(collection(db, 'households', code, 'entries'), (snapshot) => {
+  return onSnapshot(collection(db, 'households', code, 'entries'), { includeMetadataChanges:true }, (snapshot) => {
+    if(snapshot.metadata.fromCache||snapshot.metadata.hasPendingWrites)return;
     onEntries(sortedEntries(snapshot.docs));
   }, onError);
+}
+
+export async function changeHouseholdTimer(code:string, expected:Record<string,unknown>|null, next:CloudEntry|null, finishedEntry?:CloudEntry) {
+  const { db }=await signedInServices();
+  const timerRef=doc(db,'households',code,'entries','_active');
+  return runTransaction(db,async transaction=>{
+    const snapshot=await transaction.get(timerRef);
+    const current=snapshot.exists()?snapshot.data():null;
+    if(!sameTimerRevision(current,expected))return false;
+    if(next)transaction.set(timerRef,next);
+    else transaction.delete(timerRef);
+    if(finishedEntry)transaction.set(doc(db,'households',code,'entries',finishedEntry.id),finishedEntry);
+    return true;
+  });
 }
 
 export async function refreshHouseholdEntries(code: string) {
