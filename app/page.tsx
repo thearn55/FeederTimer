@@ -9,10 +9,11 @@ type BottleUnit = 'mL' | 'oz';
 type BottleKind = 'formula' | 'breastmilk';
 type NursingEntry = { id:string; type:'nursing'; startedAt:number; endedAt:number; leftDuration:number; rightDuration:number; startSide?:Side; endSide?:Side };
 type FormulaEntry = { id:string; type:'formula'; startedAt:number; endedAt:number; amount?:number; unit?:BottleUnit; ml?:number; bottleKind?:BottleKind };
-type FeedEntry = NursingEntry | FormulaEntry;
+type MedicationEntry = { id:string; type:'medication'; startedAt:number; endedAt:number; medicationName:string };
+type FeedEntry = NursingEntry | FormulaEntry | MedicationEntry;
 type ActiveSession = { startedAt:number; currentSide:Side; startSide:Side; segmentStartedAt:number; leftDuration:number; rightDuration:number; isPaused:boolean; updatedAt:number };
 type Active = ActiveSession | null;
-type EditDraft = { id?:string; kind:'nursing'|'bottle'; dateTime:string; leftMinutes:string; rightMinutes:string; amount:string; unit:BottleUnit; bottleKind:BottleKind };
+type EditDraft = { id?:string; kind:'nursing'|'bottle'|'medication'; medicationName?:string; dateTime:string; leftMinutes:string; rightMinutes:string; amount:string; unit:BottleUnit; bottleKind:BottleKind };
 type UndoAction = { message:string; action:()=>Promise<void> } | null;
 
 const FEEDS_KEY = 'latch-feeds-v2';
@@ -51,6 +52,10 @@ export default function Home() {
   const [timerBusy,setTimerBusy]=useState(false);
   const [timerNotice,setTimerNotice]=useState('');
   const [editError,setEditError]=useState('');
+  const [medicationName,setMedicationName]=useState('');
+  const [medicationSaving,setMedicationSaving]=useState(false);
+  const medicationPending=useRef(false);
+  const [medicationError,setMedicationError]=useState('');
 
   useEffect(()=>{
     try { const savedHousehold=localStorage.getItem(HOUSEHOLD_KEY)||''; setEntries(JSON.parse(localStorage.getItem(FEEDS_KEY)||'[]')); setActive(savedHousehold?null:JSON.parse(localStorage.getItem(ACTIVE_KEY)||'null')); setHousehold(savedHousehold); if(savedHousehold)setSyncState('connecting'); setReminderHours(Number(localStorage.getItem(REMINDER_KEY)||0)); } catch { /* Ignore damaged local data. */ }
@@ -80,14 +85,14 @@ export default function Home() {
   const liveRight=active ? active.rightDuration+(isRunning&&active.currentSide==='right'?Math.floor((now-active.segmentStartedAt)/1000):0) : 0;
   const orderedEntries=useMemo(()=>sortFeeds(entries,now),[entries,now]);
   const completedEntries=orderedEntries.filter(entry=>!needsDateCorrection(entry,now));
-  const today=completedEntries.filter(e=>isToday(e.startedAt));
+  const today=completedEntries.filter(e=>e.type!=='medication'&&isToday(e.startedAt));
   const totals=useMemo(()=>({
     left:today.filter((e):e is NursingEntry=>e.type==='nursing').reduce((n,e)=>n+e.leftDuration,0),
     right:today.filter((e):e is NursingEntry=>e.type==='nursing').reduce((n,e)=>n+e.rightDuration,0),
     formulaMl:today.filter((e):e is FormulaEntry=>e.type==='formula'&&(e.unit??'mL')==='mL').reduce((n,e)=>n+(e.amount??e.ml??0),0),
     formulaOz:today.filter((e):e is FormulaEntry=>e.type==='formula'&&e.unit==='oz').reduce((n,e)=>n+(e.amount??0),0),
   }),[today]);
-  const lastFeed=[...completedEntries].sort((a,b)=>b.endedAt-a.endedAt)[0];
+  const lastFeed=completedEntries.filter(e=>e.type!=='medication').sort((a,b)=>b.endedAt-a.endedAt)[0];
   const lastNursing=completedEntries.find((entry):entry is NursingEntry=>entry.type==='nursing');
   const timerDisabled=!ready||timerBusy||Boolean(household&&syncState!=='synced');
   const lastSide=lastNursing?.endSide??(lastNursing?(lastNursing.rightDuration>lastNursing.leftDuration?'right':'left'):null);
@@ -160,6 +165,20 @@ export default function Home() {
     const entry:FormulaEntry={id:crypto.randomUUID(),type:'formula',startedAt:timestamp,endedAt:timestamp,amount,unit:bottleUnit,bottleKind};
     void rawPersist(entry); setFormulaAmount(''); setUndo({message:'Bottle saved',action:()=>rawDelete(entry.id)});
   }
+  async function addMedication() {
+    const name=medicationName.trim();
+    if(!name||medicationPending.current)return;
+    medicationPending.current=true;setMedicationSaving(true);setMedicationError('');
+    const timestamp=Date.now();
+    const entry:MedicationEntry={id:crypto.randomUUID(),type:'medication',startedAt:timestamp,endedAt:timestamp,medicationName:name};
+    try {
+      if(household&&isFirebaseConfigured())await saveHouseholdEntry(household,entry);
+      setEntries(current=>sortFeeds([entry,...current.filter(item=>item.id!==entry.id)],Date.now()));
+      setNow(Date.now());setMedicationName('');
+      setUndo({message:'Medication logged',action:()=>rawDelete(entry.id)});
+    } catch { setSyncState('error');setMedicationError('Medication could not be saved. Check your connection and try again.'); }
+    finally {medicationPending.current=false;setMedicationSaving(false);}
+  }
   async function removeEntry(id:string) {
     const removed=entries.find(e=>e.id===id); if(!removed)return;
     await rawDelete(id); setUndo({message:'Entry deleted',action:()=>rawPersist(removed)});
@@ -178,14 +197,21 @@ export default function Home() {
     setEditError('');
     if(entry?.type==='nursing')setEditDraft({id:entry.id,kind:'nursing',dateTime:inputDateTime(entry.startedAt),leftMinutes:String(Math.round(entry.leftDuration/60)),rightMinutes:String(Math.round(entry.rightDuration/60)),amount:'',unit:'mL',bottleKind:'formula'});
     else if(entry?.type==='formula')setEditDraft({id:entry.id,kind:'bottle',dateTime:inputDateTime(entry.startedAt),leftMinutes:'',rightMinutes:'',amount:String(entry.amount??entry.ml??0),unit:entry.unit??'mL',bottleKind:entry.bottleKind??'formula'});
+    else if(entry?.type==='medication')setEditDraft({id:entry.id,kind:'medication',medicationName:entry.medicationName,dateTime:inputDateTime(entry.startedAt),leftMinutes:'',rightMinutes:'',amount:'',unit:'mL',bottleKind:'formula'});
     else setEditDraft({kind:'nursing',dateTime:inputDateTime(Date.now()),leftMinutes:'',rightMinutes:'',amount:'',unit:'mL',bottleKind:'formula'});
   }
   async function saveManual() {
     if(!editDraft)return; const old=editDraft.id?entries.find(e=>e.id===editDraft.id):undefined;
     const startedAt=new Date(editDraft.dateTime).getTime(); if(!Number.isFinite(startedAt)){setEditError('Enter a valid date and time.');return;}
-    const entry:FeedEntry=editDraft.kind==='nursing'?{id:editDraft.id??crypto.randomUUID(),type:'nursing',startedAt,endedAt:startedAt+(Number(editDraft.leftMinutes)+Number(editDraft.rightMinutes))*60000,leftDuration:Math.round(Number(editDraft.leftMinutes)*60),rightDuration:Math.round(Number(editDraft.rightMinutes)*60)}:{id:editDraft.id??crypto.randomUUID(),type:'formula',startedAt,endedAt:startedAt,amount:Number(editDraft.amount),unit:editDraft.unit,bottleKind:editDraft.bottleKind};
-    if(needsDateCorrection(entry,Date.now())){setEditError('This feeding is dated in the future. Check the date, AM/PM, and duration before saving.');return;}
-    await rawPersist(entry); setEditDraft(null); setUndo({message:old?'Entry updated':'Past entry added',action:()=>old?rawPersist(old):rawDelete(entry.id)});
+    if(editDraft.kind==='medication'&&!editDraft.medicationName?.trim()){setEditError('Enter the medication name.');return;}
+    const entry:FeedEntry=editDraft.kind==='medication'?{id:editDraft.id??crypto.randomUUID(),type:'medication',startedAt,endedAt:startedAt,medicationName:editDraft.medicationName!.trim()}:editDraft.kind==='nursing'?{id:editDraft.id??crypto.randomUUID(),type:'nursing',startedAt,endedAt:startedAt+(Number(editDraft.leftMinutes)+Number(editDraft.rightMinutes))*60000,leftDuration:Math.round(Number(editDraft.leftMinutes)*60),rightDuration:Math.round(Number(editDraft.rightMinutes)*60)}:{id:editDraft.id??crypto.randomUUID(),type:'formula',startedAt,endedAt:startedAt,amount:Number(editDraft.amount),unit:editDraft.unit,bottleKind:editDraft.bottleKind};
+    if(needsDateCorrection(entry,Date.now())){setEditError('This entry is dated in the future. Check the date, AM/PM, and duration before saving.');return;}
+    if(entry.type==='medication'&&household&&isFirebaseConfigured()) {
+      try { await saveHouseholdEntry(household,entry); }
+      catch { setSyncState('error');setEditError('Medication could not be saved. Check your connection and try again.');return; }
+      setNow(Date.now());setEntries(current=>sortFeeds([entry,...current.filter(item=>item.id!==entry.id)],Date.now()));
+    } else await rawPersist(entry);
+    setEditDraft(null); setUndo({message:old?'Entry updated':'Past entry added',action:()=>old?rawPersist(old):rawDelete(entry.id)});
   }
 
   return <main className="app-shell">
@@ -212,10 +238,20 @@ export default function Home() {
 
     <section className="formula-card"><div><div className="eyebrow">Bottle feeding</div><h2>Add bottle</h2><div className="kind-toggle"><button className={bottleKind==='formula'?'selected':''} onClick={()=>setBottleKind('formula')}>Formula</button><button className={bottleKind==='breastmilk'?'selected':''} onClick={()=>setBottleKind('breastmilk')}>Pumped milk</button></div></div><div className="formula-input"><input type="number" min="0.1" step="0.1" inputMode="decimal" value={formulaAmount} onChange={e=>setFormulaAmount(e.target.value)} placeholder="0" aria-label={`Bottle amount in ${bottleUnit}`}/><div className="unit-toggle" aria-label="Bottle unit"><button className={bottleUnit==='mL'?'selected':''} onClick={()=>setBottleUnit('mL')}>mL</button><button className={bottleUnit==='oz'?'selected':''} onClick={()=>setBottleUnit('oz')}>oz</button></div><button onClick={addFormula} disabled={!Number(formulaAmount)}>Add bottle</button></div></section>
 
+    <section className="medication-card" aria-labelledby="medication-heading">
+      <div className="eyebrow">Medication</div><h2 id="medication-heading">Log meds</h2>
+      <form className="medication-form" onSubmit={event=>{event.preventDefault();void addMedication();}}>
+        <label htmlFor="medication-name">Medication name</label>
+        <div><input id="medication-name" type="text" maxLength={120} required value={medicationName} disabled={medicationSaving} onChange={event=>setMedicationName(event.target.value)} placeholder="Type the medication name"/><button type="submit" disabled={!ready||!medicationName.trim()||medicationSaving}>{medicationSaving?'Saving…':'Given now'}</button></div>
+      </form>
+      <p>Records the current time in your shared timeline.</p>
+      {medicationError&&<p className="sync-error" role="alert">{medicationError}</p>}
+    </section>
+
     <section className="today" aria-labelledby="today-heading"><div className="section-heading"><div><div className="eyebrow">At a glance</div><h2 id="today-heading">Today</h2></div><strong>{today.length} {today.length===1?'entry':'entries'}</strong></div><div className="summary-grid four"><article><span className="dot left-dot"/>Left<strong>{durationLabel(totals.left)}</strong></article><article><span className="dot right-dot"/>Right<strong>{durationLabel(totals.right)}</strong></article><article><span className="dot formula-dot"/>Formula<strong>{totals.formulaMl} mL · {totals.formulaOz} oz</strong></article><article><span className="dot total-dot"/>Total<strong>{today.length}</strong></article></div></section>
 
-    <section className="history" aria-labelledby="history-heading"><div className="section-heading"><div><div className="eyebrow">Saved after finishing</div><h2 id="history-heading">Recent feeds</h2></div><div className="history-actions"><button className="manual-button" onClick={()=>openManual()}>+ Add past</button>{household&&<button className="refresh-button" onClick={()=>void refreshHistory()} disabled={syncState==='connecting'}>{syncState==='connecting'?'Refreshing…':'↻ Refresh'}</button>}</div></div>{syncState==='error'&&<div className="sync-error">Could not reach the shared history. Check your connection, then refresh.</div>}{entries.some(entry=>needsDateCorrection(entry,now))&&<p className="sync-error" role="status">A feeding has a future or invalid time. Use Edit to correct it; it is excluded from Last feeding and Today until corrected. {entries.filter(entry=>needsDateCorrection(entry,now)).map(entry=><button className="edit-button" key={entry.id} onClick={()=>openManual(entry)}>Edit {new Date(entry.startedAt).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</button>)}</p>}{!entries.length?<div className="empty-state"><span>◷</span><p>Your feeding history will appear here.</p></div>:<div className="feed-list">{orderedEntries.slice(0,30).map(entry=>{const bottleAmount=entry.type==='formula'?(entry.amount??entry.ml??0):0;const unit=entry.type==='formula'?(entry.unit??'mL'):'mL';const bottleLabel=entry.type==='formula'&&entry.bottleKind==='breastmilk'?'Pumped milk':'Formula';return <article className="feed-row" key={entry.id}><div className={`feed-icon ${entry.type}`}>{entry.type==='formula'?unit:'B'}</div><div className="feed-main"><strong>{entry.type==='formula'?`${bottleLabel} bottle · ${bottleAmount} ${unit}`:'Breastfeeding'}</strong>{needsDateCorrection(entry,now)&&<span className="date-warning">Check date/time — tap Edit</span>}<span>{new Date(entry.startedAt).toLocaleDateString([],{month:'short',day:'numeric'})} · {new Date(entry.startedAt).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}{entry.type==='nursing'?` · L ${durationLabel(entry.leftDuration)} · R ${durationLabel(entry.rightDuration)}`:''}</span></div><strong className="feed-duration">{entry.type==='formula'?`${bottleAmount} ${unit}`:durationLabel(entry.leftDuration+entry.rightDuration)}</strong><button className="edit-button" aria-label="Edit feeding entry" onClick={()=>openManual(entry)}>Edit</button><button className="delete-button" aria-label="Delete feeding entry" onClick={()=>void removeEntry(entry.id)}>×</button></article>})}</div>}</section>
-    {editDraft&&<div className="modal-backdrop" role="presentation"><section className="edit-modal" role="dialog" aria-modal="true" aria-labelledby="edit-title"><div className="section-heading"><div><div className="eyebrow">History</div><h2 id="edit-title">{editDraft.id?'Edit entry':'Add past entry'}</h2></div><button className="close-button" onClick={()=>setEditDraft(null)}>×</button></div><div className="entry-type-toggle"><button className={editDraft.kind==='nursing'?'selected':''} onClick={()=>setEditDraft({...editDraft,kind:'nursing'})}>Breastfeeding</button><button className={editDraft.kind==='bottle'?'selected':''} onClick={()=>setEditDraft({...editDraft,kind:'bottle'})}>Bottle</button></div><label>Date and time<input type="datetime-local" value={editDraft.dateTime} onChange={e=>setEditDraft({...editDraft,dateTime:e.target.value})}/></label>{editDraft.kind==='nursing'?<div className="manual-grid"><label>Left minutes<input type="number" min="0" value={editDraft.leftMinutes} onChange={e=>setEditDraft({...editDraft,leftMinutes:e.target.value})}/></label><label>Right minutes<input type="number" min="0" value={editDraft.rightMinutes} onChange={e=>setEditDraft({...editDraft,rightMinutes:e.target.value})}/></label></div>:<><div className="entry-type-toggle"><button className={editDraft.bottleKind==='formula'?'selected':''} onClick={()=>setEditDraft({...editDraft,bottleKind:'formula'})}>Formula</button><button className={editDraft.bottleKind==='breastmilk'?'selected':''} onClick={()=>setEditDraft({...editDraft,bottleKind:'breastmilk'})}>Pumped milk</button></div><div className="manual-grid"><label>Amount<input type="number" min="0.1" step="0.1" value={editDraft.amount} onChange={e=>setEditDraft({...editDraft,amount:e.target.value})}/></label><label>Unit<select value={editDraft.unit} onChange={e=>setEditDraft({...editDraft,unit:e.target.value as BottleUnit})}><option>mL</option><option>oz</option></select></label></div></>}{editError&&<p className="sync-error" role="alert">{editError}</p>}<button className="save-edit" onClick={()=>void saveManual()}>Save entry</button></section></div>}
+    <section className="history" aria-labelledby="history-heading"><div className="section-heading"><div><div className="eyebrow">Feeds &amp; medications</div><h2 id="history-heading">Timeline</h2></div><div className="history-actions"><button className="manual-button" onClick={()=>openManual()}>+ Add past</button>{household&&<button className="refresh-button" onClick={()=>void refreshHistory()} disabled={syncState==='connecting'}>{syncState==='connecting'?'Refreshing…':'↻ Refresh'}</button>}</div></div>{syncState==='error'&&<div className="sync-error">Could not reach the shared history. Check your connection, then refresh.</div>}{entries.some(entry=>needsDateCorrection(entry,now))&&<p className="sync-error" role="status">An entry has a future or invalid time. Use Edit to correct it; it is excluded from Last feeding and Today until corrected. {entries.filter(entry=>needsDateCorrection(entry,now)).map(entry=><button className="edit-button" key={entry.id} onClick={()=>openManual(entry)}>Edit {new Date(entry.startedAt).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</button>)}</p>}{!entries.length?<div className="empty-state"><span>◷</span><p>Your feedings and medications will appear here.</p></div>:<div className="feed-list">{orderedEntries.slice(0,30).map(entry=>{const bottleAmount=entry.type==='formula'?(entry.amount??entry.ml??0):0;const unit=entry.type==='formula'?(entry.unit??'mL'):'mL';const bottleLabel=entry.type==='formula'&&entry.bottleKind==='breastmilk'?'Pumped milk':'Formula';return <article className="feed-row" key={entry.id}><div className={`feed-icon ${entry.type}`}>{entry.type==='medication'?'M':entry.type==='formula'?unit:'B'}</div><div className="feed-main"><strong>{entry.type==='medication'?`Medication · ${entry.medicationName}`:entry.type==='formula'?`${bottleLabel} bottle · ${bottleAmount} ${unit}`:'Breastfeeding'}</strong>{needsDateCorrection(entry,now)&&<span className="date-warning">Check date/time — tap Edit</span>}<span>{new Date(entry.startedAt).toLocaleDateString([],{month:'short',day:'numeric'})} · {new Date(entry.startedAt).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}{entry.type==='nursing'?` · L ${durationLabel(entry.leftDuration)} · R ${durationLabel(entry.rightDuration)}`:''}</span></div><strong className="feed-duration">{entry.type==='medication'?'Given':entry.type==='formula'?`${bottleAmount} ${unit}`:durationLabel(entry.leftDuration+entry.rightDuration)}</strong><button className="edit-button" aria-label="Edit timeline entry" onClick={()=>openManual(entry)}>Edit</button><button className="delete-button" aria-label="Delete timeline entry" onClick={()=>void removeEntry(entry.id)}>×</button></article>})}</div>}</section>
+    {editDraft&&<div className="modal-backdrop" role="presentation"><section className="edit-modal" role="dialog" aria-modal="true" aria-labelledby="edit-title"><div className="section-heading"><div><div className="eyebrow">History</div><h2 id="edit-title">{editDraft.id?'Edit entry':'Add past entry'}</h2></div><button className="close-button" onClick={()=>setEditDraft(null)}>×</button></div><div className="entry-type-toggle"><button className={editDraft.kind==='nursing'?'selected':''} onClick={()=>setEditDraft({...editDraft,kind:'nursing'})}>Breastfeeding</button><button className={editDraft.kind==='bottle'?'selected':''} onClick={()=>setEditDraft({...editDraft,kind:'bottle'})}>Bottle</button><button className={editDraft.kind==='medication'?'selected':''} onClick={()=>setEditDraft({...editDraft,kind:'medication'})}>Medication</button></div><label>Date and time<input type="datetime-local" value={editDraft.dateTime} onChange={e=>setEditDraft({...editDraft,dateTime:e.target.value})}/></label>{editDraft.kind==='medication'?<label>Medication name<input maxLength={120} value={editDraft.medicationName??''} onChange={e=>setEditDraft({...editDraft,medicationName:e.target.value})}/></label>:editDraft.kind==='nursing'?<div className="manual-grid"><label>Left minutes<input type="number" min="0" value={editDraft.leftMinutes} onChange={e=>setEditDraft({...editDraft,leftMinutes:e.target.value})}/></label><label>Right minutes<input type="number" min="0" value={editDraft.rightMinutes} onChange={e=>setEditDraft({...editDraft,rightMinutes:e.target.value})}/></label></div>:<><div className="entry-type-toggle"><button className={editDraft.bottleKind==='formula'?'selected':''} onClick={()=>setEditDraft({...editDraft,bottleKind:'formula'})}>Formula</button><button className={editDraft.bottleKind==='breastmilk'?'selected':''} onClick={()=>setEditDraft({...editDraft,bottleKind:'breastmilk'})}>Pumped milk</button></div><div className="manual-grid"><label>Amount<input type="number" min="0.1" step="0.1" value={editDraft.amount} onChange={e=>setEditDraft({...editDraft,amount:e.target.value})}/></label><label>Unit<select value={editDraft.unit} onChange={e=>setEditDraft({...editDraft,unit:e.target.value as BottleUnit})}><option>mL</option><option>oz</option></select></label></div></>}{editError&&<p className="sync-error" role="alert">{editError}</p>}<button className="save-edit" onClick={()=>void saveManual()}>Save entry</button></section></div>}
     {undo&&<div className="undo-toast" role="status"><span>{undo.message}</span><button onClick={()=>{void undo.action();setUndo(null);}}>Undo</button></div>}
     <footer>Free, simple, and made for sleepy moments.</footer>
   </main>;
